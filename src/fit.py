@@ -3,11 +3,21 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
+# Astropy imports
 from astropy.io import fits
 from astropy.table import Table
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+
+# JAX & ezTaoX imports for DRW fitting
+import jax
+import jax.numpy as jnp
+import numpyro
+import numpyro.distributions as dist
+from eztaox.kernels.quasisep import Exp
+from eztaox.models import UniVarModel
+from eztaox.fitter import random_search
+import tinygp
 
 # -----------------------------
 # 0) YOUR BASE LC LOADER (as-is)
@@ -153,11 +163,69 @@ def plot_mag_vs_time(df: pd.DataFrame, object_id=None, band=None) -> plt.Axes:
    plt.tight_layout()
    return ax
 
+def fit_drw_eztaox(df: pd.DataFrame, object_id, band, n_sample=5000, n_best=5, seed=1):
+    """
+    Fits a Damped Random Walk (DRW) model to a single-band light curve 
+    from the combined DataFrame using ezTaoX.
+    """
+    sub_df = df.loc[(df["objectId"] == object_id) & (df["band"] == band)].sort_values("time")
+    
+    if len(sub_df) < 5:
+        raise ValueError(f"Not enough data points found for object {object_id} in band {band} to fit DRW.")
+
+    sim_t = jnp.array(sub_df["time"].values)
+    sim_y = jnp.array(sub_df["mag"].values)
+    sim_yerr = jnp.array(sub_df["magerr"].values)
+
+    # Initialize model kernel and UniVarModel instance
+    zero_mean = False
+    k = Exp(scale=100.0, sigma=1.0)
+    model = UniVarModel(sim_t, sim_y, sim_yerr, k, zero_mean=zero_mean)
+
+    # Define the initialization/prior sampler for random search
+    def init_sampler():
+        log_drw_scale = numpyro.sample("log_drw_scale", dist.Uniform(jnp.log(0.01), jnp.log(1000)))
+        log_drw_sigma = numpyro.sample("log_drw_sigma", dist.Uniform(jnp.log(0.01), jnp.log(10)))
+        log_kernel_param = jnp.stack([log_drw_scale, log_drw_sigma])
+        numpyro.deterministic("log_kernel_param", log_kernel_param)
+        
+        mean = numpyro.sample("mean", dist.Uniform(low=float(sim_y.min()), high=float(sim_y.max())))
+        return {"log_kernel_param": log_kernel_param, "mean": mean}
+
+    fit_key = jax.random.PRNGKey(seed)
+    best_params, log_likelihoods = random_search(model, init_sampler, fit_key, n_sample=n_sample, n_best=n_best)
+    
+    # Extract best fit parameters mapping back to DRW physical units
+    log_scale_best = best_params["log_kernel_param"][0]
+    log_sigma_best = best_params["log_kernel_param"][1]
+    
+    results = {
+        "objectId": object_id,
+        "band": band,
+        "log_drw_scale": float(log_scale_best),
+        "log_drw_sigma": float(log_sigma_best),
+        "tau_drw": float(np.exp(log_scale_best)),
+        "sigma_drw": float(np.exp(log_sigma_best)),
+        "best_params": best_params,
+        "log_likelihoods": log_likelihoods
+    }
+    
+    return results
 
 if __name__ == "__main__":
-   df_total = concat_light_curves_df()
-   print(df_total.head(n=10))
-   if not df_total.empty:
-       sample_obj = df_total["objectId"].iloc[3]
-       plot_mag_vs_time(df_total, object_id=sample_obj, band="g")
-       plt.show()
+    df_total = concat_light_curves_df()
+    print(df_total.head(n=10))
+    
+    if not df_total.empty:
+        sample_obj = df_total["objectId"].iloc[3]
+        plot_mag_vs_time(df_total, object_id=sample_obj, band="g")
+        plt.savefig(f"light_curve_object_{sample_obj}_g_band.png")
+
+        # Run ezTaoX DRW fit on the sample object and band
+        print(f"\nFitting DRW model for object {sample_obj} in g-band")
+        fit_res = fit_drw_eztaox(df_total, object_id=sample_obj, band="g")
+        print("Fit Results:")
+        print(f"  -> Natural Log Scale (tau): {fit_res['log_drw_scale']:.4f}")
+        print(f"  -> Natural Log Sigma: {fit_res['log_drw_sigma']:.4f}")
+        print(f"  -> Damping Timescale (tau_DRW): {fit_res['tau_drw']:.2f} days")
+        print(f"  -> Variability Amplitude (sigma_DRW): {fit_res['sigma_drw']:.4f}")
